@@ -24,10 +24,13 @@ func hasRuby() bool {
 
 // rubyResult runs a one-liner that builds a StringScanner over input and prints
 // one line per probe; the Go side reproduces the same probe sequence.
-func runRuby(t *testing.T, script string, args ...string) string {
+func runRuby(t *testing.T, script, input string) string {
 	t.Helper()
-	full := append([]string{"-rstrscan", "-e", "$stdout.binmode; " + script, "--"}, args...)
-	cmd := exec.Command("ruby", full...)
+	// The input is fed on binmode stdin (not argv): a Windows command line would
+	// CRLF-translate an embedded "\n", making ruby scan a different string than
+	// the Go library and diverging on every newline-bearing case.
+	cmd := exec.Command("ruby", "-rstrscan", "-e", "$stdout.binmode; "+script)
+	cmd.Stdin = strings.NewReader(input)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -291,7 +294,7 @@ def out(v); emit(v.nil? ? "\x00NIL" : v); end
 def outi(v); emit(v.nil? ? "-1" : v.to_s); end
 def outb(v); emit(v ? "true" : "false"); end
 def outr(v); emit(v); end
-s = StringScanner.new(ARGV[0].dup.force_encoding("UTF-8"))
+s = StringScanner.new($stdin.binmode.read.force_encoding("UTF-8"))
 `)
 	for _, p := range probes {
 		prog.WriteString(rubyProbe(p))
