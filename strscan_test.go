@@ -1,6 +1,7 @@
 package strscan
 
 import (
+	"sync"
 	"testing"
 )
 
@@ -418,6 +419,48 @@ func TestCompileCacheHit(t *testing.T) {
 	}
 	if _, ok := s.Scan(`a`); !ok {
 		t.Fatal("second scan a (cache hit)")
+	}
+}
+
+// TestCompileCacheConcurrent drives many Scanners against a shared set of
+// patterns from many goroutines at once. With the unsynchronized map cache this
+// reproduced a data race; the sync.Map cache must run clean under `go test
+// -race`. It also exercises concurrent compile misses on the same source string
+// (LoadOrStore collapsing duplicates) and concurrent matching on the shared
+// compiled *Regexp.
+func TestCompileCacheConcurrent(t *testing.T) {
+	patterns := []string{`[A-Za-z]+`, `\s+`, `[0-9]+`, `[-+*/]`}
+	var wg sync.WaitGroup
+	for g := 0; g < 32; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				s := New("abc 123 + def 456")
+				for _, p := range patterns {
+					s.Reset()
+					s.Scan(p)
+					s.ScanUntil(p)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestCompileCacheMalformedNotCached confirms a malformed pattern keeps failing
+// the same way (errors are surfaced as "no match", never cached as a result that
+// would change behavior) and that a later valid pattern still compiles.
+func TestCompileCacheMalformedNotCached(t *testing.T) {
+	s := New("aaa")
+	if _, ok := s.Scan(`(`); ok {
+		t.Fatal("malformed pattern should miss")
+	}
+	if _, ok := s.Scan(`(`); ok {
+		t.Fatal("malformed pattern should still miss on repeat")
+	}
+	if _, ok := s.Scan(`a`); !ok {
+		t.Fatal("valid pattern after malformed should match")
 	}
 }
 
