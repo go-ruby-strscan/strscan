@@ -19,6 +19,7 @@ package strscan
 
 import (
 	"fmt"
+	"sync"
 	"unicode/utf8"
 
 	onigmo "github.com/go-ruby-regexp/regexp"
@@ -58,23 +59,36 @@ func New(s string) *Scanner {
 
 // regexpCache memoizes compiled patterns so repeated scans with the same source
 // pattern do not recompile. Patterns come from the caller (rbgo passes the
-// Regexp#source), so the set is small and bounded in practice.
-var regexpCache = map[string]*onigmo.Regexp{}
+// Regexp#source), so the set is small and bounded in practice, and an unbounded
+// map is fine: the live key set is the handful of distinct regexp literals a
+// lexer reuses. The cache is process-wide and shared across every Scanner so the
+// win carries across scanners; it is a sync.Map, making the read-mostly hot path
+// lock-free and safe under concurrent Scanners (the cache passes -race).
+//
+// Only the compiled value is keyed by the source string. The flags a caller
+// wants are embedded inline in that source (e.g. "(?imx)..."), so two callers
+// passing the same source get the same compiled regexp — caching by source is
+// correctness-safe and byte-for-byte equivalent to compiling every time.
+var regexpCache sync.Map // map[string]*onigmo.Regexp
 
 // compile returns the compiled form of pattern, caching it. A malformed pattern
 // returns an error, which the scanning methods surface as "no match" — Ruby
 // would have raised at Regexp construction, before the scan, so a bad pattern
-// never matches here.
+// never matches here. Compile errors are NOT cached: error behavior is identical
+// to compiling every call, and the malformed-pattern set is not a hot path.
 func compile(pattern string) (*onigmo.Regexp, error) {
-	if re, ok := regexpCache[pattern]; ok {
-		return re, nil
+	if v, ok := regexpCache.Load(pattern); ok {
+		return v.(*onigmo.Regexp), nil
 	}
 	re, err := onigmo.Compile(pattern)
 	if err != nil {
 		return nil, err
 	}
-	regexpCache[pattern] = re
-	return re, nil
+	// LoadOrStore keeps a single shared *Regexp per source even when two
+	// goroutines miss and compile concurrently: the first store wins, losers
+	// drop their duplicate and reuse the winner.
+	actual, _ := regexpCache.LoadOrStore(pattern, re)
+	return actual.(*onigmo.Regexp), nil
 }
 
 // matchAt matches pattern against the remainder str[pos:]; the returned offsets
