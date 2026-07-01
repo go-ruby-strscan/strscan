@@ -91,12 +91,33 @@ func compile(pattern string) (*onigmo.Regexp, error) {
 	return actual.(*onigmo.Regexp), nil
 }
 
-// matchAt matches pattern against the remainder str[pos:]; the returned offsets
-// are translated back into absolute offsets in str. anchored requires the match
-// to begin exactly at pos (Ruby's \G / scan semantics); otherwise the first
-// match anywhere in the remainder is returned (scan_until semantics). ok is
-// false when the pattern is malformed or does not match.
-func (s *Scanner) matchAt(pattern string, anchored bool) (md *onigmo.MatchData, beg, end int, ok bool) {
+// matchAnchored matches pattern anchored exactly at the current position using
+// the regexp engine's cursor-anchored primitive (Regexp.MatchAt), binding \G to
+// pos and keeping the whole string visible so ^/\A and lookbehind see the real
+// prefix str[:pos]. It is O(match length), not O(remaining length): it tries a
+// single match at pos rather than scanning the entire tail and rejecting a match
+// that did not start at pos — the fix for the O(n²) tokenize blow-up. The
+// returned MatchData carries absolute byte offsets into str, so beg/end are used
+// directly. ok is false when the pattern is malformed or does not match at pos.
+func (s *Scanner) matchAnchored(pattern string) (md *onigmo.MatchData, beg, end int, ok bool) {
+	re, err := compile(pattern)
+	if err != nil {
+		return nil, 0, 0, false
+	}
+	m := re.MatchAt(s.str, s.pos)
+	if m == nil {
+		return nil, 0, 0, false
+	}
+	return m, m.Begin(0), m.End(0), true
+}
+
+// matchForward searches forward from the current position for the first match of
+// pattern anywhere ahead (Ruby's scan_until / check_until semantics). This is an
+// inherently forward-scanning operation — it must walk ahead until a match is
+// found — so O(remaining length) is the correct complexity, not the anchored
+// bug. The returned offsets are translated back into absolute offsets in str.
+// ok is false when the pattern is malformed or does not match.
+func (s *Scanner) matchForward(pattern string) (md *onigmo.MatchData, beg, end int, ok bool) {
 	re, err := compile(pattern)
 	if err != nil {
 		return nil, 0, 0, false
@@ -104,9 +125,6 @@ func (s *Scanner) matchAt(pattern string, anchored bool) (md *onigmo.MatchData, 
 	rest := s.str[s.pos:]
 	m := re.Match(rest)
 	if m == nil {
-		return nil, 0, 0, false
-	}
-	if anchored && m.Begin(0) != 0 {
 		return nil, 0, 0, false
 	}
 	return m, s.pos + m.Begin(0), s.pos + m.End(0), true
@@ -139,7 +157,7 @@ func (s *Scanner) clearMatch() {
 // returns "" / false, clears the recorded match, and leaves the position.
 // (Ruby's StringScanner#scan.)
 func (s *Scanner) Scan(pattern string) (string, bool) {
-	md, beg, end, ok := s.matchAt(pattern, true)
+	md, beg, end, ok := s.matchAnchored(pattern)
 	if !ok {
 		s.clearMatch()
 		return "", false
@@ -153,7 +171,7 @@ func (s *Scanner) Scan(pattern string) (string, bool) {
 // returns "" / false and does not move. #matched holds just the pattern match.
 // (Ruby's StringScanner#scan_until.)
 func (s *Scanner) ScanUntil(pattern string) (string, bool) {
-	md, beg, end, ok := s.matchAt(pattern, false)
+	md, beg, end, ok := s.matchForward(pattern)
 	if !ok {
 		s.clearMatch()
 		return "", false
@@ -185,7 +203,7 @@ func (s *Scanner) SkipUntil(pattern string) (int, bool) {
 // WITHOUT advancing it, recording the match; length is -1 / false on no match.
 // (Ruby's StringScanner#match?.)
 func (s *Scanner) Match(pattern string) (int, bool) {
-	md, beg, end, ok := s.matchAt(pattern, true)
+	md, beg, end, ok := s.matchAnchored(pattern)
 	if !ok {
 		s.clearMatch()
 		return -1, false
@@ -198,7 +216,7 @@ func (s *Scanner) Match(pattern string) (int, bool) {
 // returning the matched text. "" / false and a cleared match on no match.
 // (Ruby's StringScanner#check.)
 func (s *Scanner) Check(pattern string) (string, bool) {
-	md, beg, end, ok := s.matchAt(pattern, true)
+	md, beg, end, ok := s.matchAnchored(pattern)
 	if !ok {
 		s.clearMatch()
 		return "", false
@@ -211,7 +229,7 @@ func (s *Scanner) Check(pattern string) (string, bool) {
 // returning everything from the current position through the match. "" / false
 // on no match. (Ruby's StringScanner#check_until.)
 func (s *Scanner) CheckUntil(pattern string) (string, bool) {
-	md, beg, end, ok := s.matchAt(pattern, false)
+	md, beg, end, ok := s.matchForward(pattern)
 	if !ok {
 		s.clearMatch()
 		return "", false

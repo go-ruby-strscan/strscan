@@ -1,6 +1,7 @@
 package strscan
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -85,5 +86,46 @@ func BenchmarkScanLoopCached(b *testing.B) {
 func BenchmarkScanLoopNoCache(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = lexLoopNoCache()
+	}
+}
+
+// lexLoopSize tokenizes a repeat-scaled copy of the base lexer input using the
+// production anchored Scan path. It exists to prove that the per-token anchored
+// scan is O(match length): doubling the input should roughly double the total
+// work, so ns/op divided by the repeat factor stays flat. Before the MatchAt
+// fix each anchored Scan was O(remaining length) — MatchAt scanned the whole
+// tail and rejected an off-position match — making a full pass O(n²), so the
+// per-token cost grew with input size.
+func lexLoopSize(repeat int) int {
+	input := strings.Repeat("foo123 + bar456 - baz789 * qux000 / quux ; ", repeat)
+	s := New(input)
+	n := 0
+	for !s.EOS() {
+		matched := false
+		for _, p := range benchPatterns {
+			if _, ok := s.Scan(p); ok {
+				n++
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			s.Getch()
+		}
+	}
+	return n
+}
+
+// BenchmarkScanScaling runs the anchored tokenize loop at ×1/×2/×4 input so a
+// benchmark run can confirm linear (not quadratic) scaling: the per-repeat cost
+// (ns/op ÷ size) should stay roughly constant across sizes.
+func BenchmarkScanScaling(b *testing.B) {
+	for _, size := range []int{64, 128, 256} {
+		size := size
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				_ = lexLoopSize(size)
+			}
+		})
 	}
 }
