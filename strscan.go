@@ -40,10 +40,26 @@ type Scanner struct {
 	// last-match state, all reset to the no-match sentinel by a failed match
 	// (matchValid=false). When matchValid is true a match was recorded.
 	matchValid bool
-	md         *onigmo.MatchData // the recorded match (nil for getch)
-	matched    string            // the matched text (md[0], or the char for getch)
-	matchBeg   int               // byte offset of the match start in str
-	matchEnd   int               // byte offset just past the match in str
+	matched    string // the matched text (group 0, or the char for getch)
+	matchBeg   int    // byte offset of the match start in str
+	matchEnd   int    // byte offset just past the match in str
+
+	// Lazy capture reconstruction. The regexp-driven ops (Scan/Skip/Match/…)
+	// take the allocation-free bounds-only path (MatchBoundsAt/MatchBounds),
+	// which yields the whole-match [beg,end) span but no capture groups. The
+	// capture-bearing MatchData is only ever needed when the caller actually
+	// reads a group (StringScanner#[] — Group/GroupName), which a tokenizing
+	// lexer's scan/skip/match? never does. So md is left nil and rebuilt on the
+	// first group access from the compiled pattern remembered here, reproducing
+	// the identical match: for an anchored op via lazyRe.MatchAt(lazyInput,
+	// matchBeg) — the same call the old eager path made — and for a forward
+	// (scan_until family) op via lazyRe.Match(lazyInput) over the same rest
+	// slice. lazyRe == nil marks a getch match (only group 0, no submatches) or
+	// no match, for which no MatchData is ever built.
+	md        *onigmo.MatchData // materialized captures; nil until first group read
+	lazyRe    *onigmo.Regexp    // compiled pattern to rebuild md; nil for getch/no-match
+	lazyInput string            // the string the recorded match ran against
+	lazyAnchd bool              // true: rebuild anchored at matchBeg; false: forward Match
 
 	// prevPos records the scan position before the last advancing operation so
 	// that Unscan can restore it; unscannable is true when there is nothing to
@@ -92,50 +108,62 @@ func compile(pattern string) (*onigmo.Regexp, error) {
 }
 
 // matchAnchored matches pattern anchored exactly at the current position using
-// the regexp engine's cursor-anchored primitive (Regexp.MatchAt), binding \G to
-// pos and keeping the whole string visible so ^/\A and lookbehind see the real
-// prefix str[:pos]. It is O(match length), not O(remaining length): it tries a
-// single match at pos rather than scanning the entire tail and rejecting a match
-// that did not start at pos — the fix for the O(n²) tokenize blow-up. The
-// returned MatchData carries absolute byte offsets into str, so beg/end are used
-// directly. ok is false when the pattern is malformed or does not match at pos.
-func (s *Scanner) matchAnchored(pattern string) (md *onigmo.MatchData, beg, end int, ok bool) {
+// the regexp engine's bounds-only cursor-anchored primitive (Regexp.MatchBoundsAt),
+// binding \G to pos and keeping the whole string visible so ^/\A and lookbehind
+// see the real prefix str[:pos]. It is O(match length), not O(remaining length):
+// it tries a single match at pos rather than scanning the entire tail and
+// rejecting a match that did not start at pos — the fix for the O(n²) tokenize
+// blow-up. It reports only the whole-match [beg,end) span (beg == pos on
+// success) and allocates no MatchData: the capture groups a scan/skip/match?
+// almost never reads are reconstructed lazily (see recordRe / ensureMD). The
+// returned re is the compiled pattern, remembered for that lazy rebuild. ok is
+// false when the pattern is malformed or does not match at pos.
+func (s *Scanner) matchAnchored(pattern string) (re *onigmo.Regexp, beg, end int, ok bool) {
 	re, err := compile(pattern)
 	if err != nil {
 		return nil, 0, 0, false
 	}
-	m := re.MatchAt(s.str, s.pos)
-	if m == nil {
+	beg, end, ok = re.MatchBoundsAt(s.str, s.pos)
+	if !ok {
 		return nil, 0, 0, false
 	}
-	return m, m.Begin(0), m.End(0), true
+	return re, beg, end, true
 }
 
 // matchForward searches forward from the current position for the first match of
 // pattern anywhere ahead (Ruby's scan_until / check_until semantics). This is an
 // inherently forward-scanning operation — it must walk ahead until a match is
 // found — so O(remaining length) is the correct complexity, not the anchored
-// bug. The returned offsets are translated back into absolute offsets in str.
-// ok is false when the pattern is malformed or does not match.
-func (s *Scanner) matchForward(pattern string) (md *onigmo.MatchData, beg, end int, ok bool) {
+// bug. It uses the bounds-only forward primitive (Regexp.MatchBounds) over the
+// unscanned rest, allocating no MatchData; the offsets are translated back into
+// absolute offsets in str. Captures, if later read, are rebuilt lazily against
+// that same rest slice (returned as input). ok is false when the pattern is
+// malformed or does not match.
+func (s *Scanner) matchForward(pattern string) (re *onigmo.Regexp, input string, beg, end int, ok bool) {
 	re, err := compile(pattern)
 	if err != nil {
-		return nil, 0, 0, false
+		return nil, "", 0, 0, false
 	}
 	rest := s.str[s.pos:]
-	m := re.Match(rest)
-	if m == nil {
-		return nil, 0, 0, false
+	b, e, ok := re.MatchBounds(rest)
+	if !ok {
+		return nil, "", 0, 0, false
 	}
-	return m, s.pos + m.Begin(0), s.pos + m.End(0), true
+	return re, rest, s.pos + b, s.pos + e, true
 }
 
-// record stores a successful match and remembers the pre-advance position so
-// Unscan can undo it; advancing to newPos.
-func (s *Scanner) record(md *onigmo.MatchData, beg, end, newPos int) {
+// recordRe stores a successful regexp-driven match by its bounds and remembers
+// how to rebuild its capture groups on demand (see ensureMD), remembering the
+// pre-advance position so Unscan can undo it; advancing to newPos. anchored
+// selects the lazy rebuild strategy: anchored at matchBeg over the whole string,
+// or a forward Match over input (the rest slice the forward search ran on).
+func (s *Scanner) recordRe(re *onigmo.Regexp, input string, anchored bool, beg, end, newPos int) {
 	s.prevPos = s.pos
 	s.matchValid = true
-	s.md = md
+	s.md = nil
+	s.lazyRe = re
+	s.lazyInput = input
+	s.lazyAnchd = anchored
 	s.matched = s.str[beg:end]
 	s.matchBeg = beg
 	s.matchEnd = end
@@ -143,11 +171,31 @@ func (s *Scanner) record(md *onigmo.MatchData, beg, end, newPos int) {
 	s.unscannable = false
 }
 
+// ensureMD materializes the capture-bearing MatchData for the recorded regexp
+// match on first access, reproducing the identical match the bounds-only path
+// found: anchored ops rebuild via MatchAt(lazyInput, matchBeg) — byte-for-byte
+// the call the old eager path made — and forward ops via Match(lazyInput) over
+// the same rest slice, whose leftmost match is the one recorded. It returns nil
+// for a getch match or when no match is recorded (lazyRe == nil), for which no
+// groups exist. The result is cached so repeated group reads rebuild once.
+func (s *Scanner) ensureMD() *onigmo.MatchData {
+	if s.md == nil && s.lazyRe != nil {
+		if s.lazyAnchd {
+			s.md = s.lazyRe.MatchAt(s.lazyInput, s.matchBeg)
+		} else {
+			s.md = s.lazyRe.Match(s.lazyInput)
+		}
+	}
+	return s.md
+}
+
 // clearMatch drops any recorded match (a failed scan), matching MRI which nils
 // out the last match on a miss. It also makes Unscan an error.
 func (s *Scanner) clearMatch() {
 	s.matchValid = false
 	s.md = nil
+	s.lazyRe = nil
+	s.lazyInput = ""
 	s.matched = ""
 	s.unscannable = true
 }
@@ -157,12 +205,12 @@ func (s *Scanner) clearMatch() {
 // returns "" / false, clears the recorded match, and leaves the position.
 // (Ruby's StringScanner#scan.)
 func (s *Scanner) Scan(pattern string) (string, bool) {
-	md, beg, end, ok := s.matchAnchored(pattern)
+	re, beg, end, ok := s.matchAnchored(pattern)
 	if !ok {
 		s.clearMatch()
 		return "", false
 	}
-	s.record(md, beg, end, end)
+	s.recordRe(re, s.str, true, beg, end, end)
 	return s.matched, true
 }
 
@@ -171,13 +219,13 @@ func (s *Scanner) Scan(pattern string) (string, bool) {
 // returns "" / false and does not move. #matched holds just the pattern match.
 // (Ruby's StringScanner#scan_until.)
 func (s *Scanner) ScanUntil(pattern string) (string, bool) {
-	md, beg, end, ok := s.matchForward(pattern)
+	re, input, beg, end, ok := s.matchForward(pattern)
 	if !ok {
 		s.clearMatch()
 		return "", false
 	}
 	result := s.str[s.pos:end]
-	s.record(md, beg, end, end)
+	s.recordRe(re, input, false, beg, end, end)
 	return result, true
 }
 
@@ -203,12 +251,12 @@ func (s *Scanner) SkipUntil(pattern string) (int, bool) {
 // WITHOUT advancing it, recording the match; length is -1 / false on no match.
 // (Ruby's StringScanner#match?.)
 func (s *Scanner) Match(pattern string) (int, bool) {
-	md, beg, end, ok := s.matchAnchored(pattern)
+	re, beg, end, ok := s.matchAnchored(pattern)
 	if !ok {
 		s.clearMatch()
 		return -1, false
 	}
-	s.record(md, beg, end, s.pos) // record but do not advance
+	s.recordRe(re, s.str, true, beg, end, s.pos) // record but do not advance
 	return end - beg, true
 }
 
@@ -216,12 +264,12 @@ func (s *Scanner) Match(pattern string) (int, bool) {
 // returning the matched text. "" / false and a cleared match on no match.
 // (Ruby's StringScanner#check.)
 func (s *Scanner) Check(pattern string) (string, bool) {
-	md, beg, end, ok := s.matchAnchored(pattern)
+	re, beg, end, ok := s.matchAnchored(pattern)
 	if !ok {
 		s.clearMatch()
 		return "", false
 	}
-	s.record(md, beg, end, s.pos)
+	s.recordRe(re, s.str, true, beg, end, s.pos)
 	return s.matched, true
 }
 
@@ -229,13 +277,13 @@ func (s *Scanner) Check(pattern string) (string, bool) {
 // returning everything from the current position through the match. "" / false
 // on no match. (Ruby's StringScanner#check_until.)
 func (s *Scanner) CheckUntil(pattern string) (string, bool) {
-	md, beg, end, ok := s.matchForward(pattern)
+	re, input, beg, end, ok := s.matchForward(pattern)
 	if !ok {
 		s.clearMatch()
 		return "", false
 	}
 	result := s.str[s.pos:end]
-	s.record(md, beg, end, s.pos)
+	s.recordRe(re, input, false, beg, end, s.pos)
 	return result, true
 }
 
@@ -265,7 +313,11 @@ func (s *Scanner) Getch() (string, bool) {
 	beg, end := s.pos, s.pos+sz
 	s.prevPos = s.pos
 	s.matchValid = true
-	s.md = nil // getch has no MatchData; [0] is the char, every group is nil
+	// getch has no MatchData; [0] is the char, every group is nil. lazyRe == nil
+	// keeps ensureMD from ever building one.
+	s.md = nil
+	s.lazyRe = nil
+	s.lazyInput = ""
 	s.matched = s.str[beg:end]
 	s.matchBeg = beg
 	s.matchEnd = end
@@ -384,19 +436,20 @@ func (s *Scanner) Group(i int) (string, bool) {
 	if !s.matchValid {
 		return "", false
 	}
-	if s.md == nil { // getch: only [0] is the char, every group is absent
+	md := s.ensureMD()
+	if md == nil { // getch: only [0] is the char, every group is absent
 		if i == 0 {
 			return s.matched, true
 		}
 		return "", false
 	}
-	if i < 0 || i > s.md.NGroups() {
+	if i < 0 || i > md.NGroups() {
 		return "", false
 	}
-	if s.md.Begin(i) < 0 {
+	if md.Begin(i) < 0 {
 		return "", false // group did not participate
 	}
-	return s.md.Str(i), true
+	return md.Str(i), true
 }
 
 // GroupName returns the capture group with the given name from the most recent
@@ -404,17 +457,21 @@ func (s *Scanner) Group(i int) (string, bool) {
 // or the group did not participate. (Ruby's StringScanner#[] with a
 // Symbol/String.)
 func (s *Scanner) GroupName(name string) (string, bool) {
-	if !s.matchValid || s.md == nil {
+	if !s.matchValid {
 		return "", false
 	}
-	idx := s.md.IndexOfName(name)
+	md := s.ensureMD()
+	if md == nil { // getch or no regexp match: no named groups
+		return "", false
+	}
+	idx := md.IndexOfName(name)
 	if idx < 0 {
 		return "", false
 	}
-	if s.md.Begin(idx) < 0 {
+	if md.Begin(idx) < 0 {
 		return "", false
 	}
-	return s.md.Str(idx), true
+	return md.Str(idx), true
 }
 
 // Unscan undoes the most recent advancing match, restoring the position to
@@ -429,6 +486,8 @@ func (s *Scanner) Unscan() error {
 	s.pos = s.prevPos
 	s.matchValid = false
 	s.md = nil
+	s.lazyRe = nil
+	s.lazyInput = ""
 	s.matched = ""
 	s.unscannable = true
 	return nil

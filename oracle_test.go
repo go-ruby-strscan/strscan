@@ -85,6 +85,16 @@ func TestDifferentialAgainstMRI(t *testing.T) {
 			{op: "pos"}, {op: "charpos"}, {op: "rest"},
 			{op: "scan_until", pat: `;`}, {op: "matched"}, {op: "rest"},
 		}},
+		// captures survive every recording op, exactly as MRI's #[] does after
+		// scan_until / skip / match? / check_until (not just scan): the lazy
+		// MatchData must reproduce the same groups the bounds-only match spanned.
+		{"key=val; a1=b2", []probe{
+			{op: "scan_until", pat: `(?<k>\w+)=`}, {op: "group", args: 0}, {op: "group", args: 1},
+			{op: "groupname", name: "k"}, {op: "matched"},
+			{op: "skip", pat: `(\w)(\w)`}, {op: "group", args: 1}, {op: "group", args: 2},
+			{op: "match", pat: `(l)(l?)`}, {op: "group", args: 1}, {op: "group", args: 2}, {op: "pos"},
+			{op: "check_until", pat: `(\w)(\d)`}, {op: "group", args: 1}, {op: "group", args: 2}, {op: "pos"},
+		}},
 		// check / skip family does/doesn't advance.
 		{"hello world", []probe{
 			{op: "check", pat: `hel`}, {op: "pos"},
